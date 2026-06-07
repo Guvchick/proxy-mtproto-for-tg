@@ -1,0 +1,36 @@
+# MTProto Proxy — example configuration
+# Run: ./proxy -config config.yaml
+#
+# Secret formats:
+#   32 hex chars            — simple obfuscated2  (e.g. "deadbeef...")
+#   "dd" + 32 hex chars     — padded intermediate (recommended if not using fake-TLS)
+#   "ee" + 32 hex + hex(domain) — fake-TLS masquerade (best anti-censorship)
+#
+# Generate a secret:
+#   go run ./cmd/gen-secret -faketls -domain www.google.com -host 1.2.3.4 -port 443
+
+# Bind address and port.
+listen: "0.0.0.0:443"
+
+# Proxy secret — CHANGE THIS before deployment.
+# Generate with: go run ./cmd/gen-secret -faketls -domain www.google.com
+secret: "eedeadbeef1234567890abcdef123456786f6f676c652e636f6d"
+
+# Address family for upstream DC connections: "ipv4" | "ipv6" | "prefer-ipv6"
+addr_family: "ipv4"
+
+# Optional 32-hex Telegram proxy tag (needed only to appear in Telegram's
+# official proxy list — leave empty if not needed).
+proxy_tag: ""
+
+# Copy buffer size in bytes.
+read_buf_size: 8192
+write_buf_size: 8192
+
+metrics:
+  enabled: true
+  listen: "0.0.0.0:9090"   # Prometheus /metrics endpoint
+
+log:
+  level: "info"   # debug | info | warn | error
+  format: "json"  # json | text
