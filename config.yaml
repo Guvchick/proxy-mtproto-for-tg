@@ -1,36 +1,47 @@
-# MTProto Proxy — example configuration
-# Run: ./proxy -config config.yaml
-#
-# Secret formats:
-#   32 hex chars            — simple obfuscated2  (e.g. "deadbeef...")
-#   "dd" + 32 hex chars     — padded intermediate (recommended if not using fake-TLS)
-#   "ee" + 32 hex + hex(domain) — fake-TLS masquerade (best anti-censorship)
-#
-# Generate a secret:
-#   go run ./cmd/gen-secret -faketls -domain www.google.com -host 1.2.3.4 -port 443
+# MTProto Proxy configuration
+# Generate a new secret: go run ./cmd/gen-secret -faketls -domain max.ru -host YOUR_IP -port 443
 
-# Bind address and port.
 listen: "0.0.0.0:443"
 
-# Proxy secret — CHANGE THIS before deployment.
-# Generate with: go run ./cmd/gen-secret -faketls -domain www.google.com
-secret: "eedeadbeef1234567890abcdef123456786f6f676c652e636f6d"
+# Secret formats:
+#   32 hex chars                  — simple obfuscated2
+#   "dd" + 32 hex                 — padded intermediate (recommended minimum)
+#   "ee" + 32 hex + hex(domain)   — fake-TLS (best anti-DPI)
+#   "ee" + 32 hex                 — fake-TLS, self-SNI (accepts any domain)
+#
+# Use a RU domain to avoid DPI blocks in Russia:
+#   go run ./cmd/gen-secret -faketls -domain max.ru -host 1.2.3.4 -port 443
+#
+# Self-SNI (accepts ANY domain from client — most flexible):
+#   go run ./cmd/gen-secret -faketls -host 1.2.3.4 -port 443
+secret: "REPLACE_WITH_OUTPUT_OF_gen-secret"
 
 # Address family for upstream DC connections: "ipv4" | "ipv6" | "prefer-ipv6"
 addr_family: "ipv4"
 
-# Optional 32-hex Telegram proxy tag (needed only to appear in Telegram's
-# official proxy list — leave empty if not needed).
-proxy_tag: ""
+# --- Debugging options (disable in production) ---
 
-# Copy buffer size in bytes.
-read_buf_size: 8192
-write_buf_size: 8192
+# skip_hmac_check: true  # disable HMAC-SHA256 validation in fake-TLS ClientHello
+# skip_timestamp_check: true  # disable ±1h timestamp window
 
+# --- Upstream redirect (chain proxying) ---
+#
+# When set, ALL traffic is forwarded to this server instead of Telegram DCs.
+# Useful topology:
+#   client → THIS proxy (RU server, handles fake-TLS) → upstream → Telegram DC
+#
+# The upstream server must accept plain obfuscated2 with the SAME secret.
+#
+# upstream:
+#   host: "backend.example.com"
+#   port: 8443
+
+# --- Metrics ---
 metrics:
   enabled: true
-  listen: "0.0.0.0:9090"   # Prometheus /metrics endpoint
+  listen: "0.0.0.0:9090"  # Prometheus /metrics + /healthz
 
+# --- Logging ---
 log:
   level: "info"   # debug | info | warn | error
   format: "json"  # json | text

@@ -11,15 +11,37 @@ type Config struct {
 	Listen   string `yaml:"listen"`
 	Secret   string `yaml:"secret"`
 	Workers  int    `yaml:"workers"`
-	ProxyTag string `yaml:"proxy_tag"` // optional: 32-hex Telegram proxy tag
+	ProxyTag string `yaml:"proxy_tag"`
 
 	AddrFamily string `yaml:"addr_family"` // "ipv4" | "ipv6" | "prefer-ipv6"
 
 	ReadBufSize  int `yaml:"read_buf_size"`
 	WriteBufSize int `yaml:"write_buf_size"`
 
+	// SkipHMACCheck disables the 4-byte HMAC validation in fake-TLS ClientHello.
+	// Enable only for debugging — allows replay attacks.
+	SkipHMACCheck bool `yaml:"skip_hmac_check"`
+
+	// SkipTimestampCheck disables the ±1h timestamp window in fake-TLS.
+	SkipTimestampCheck bool `yaml:"skip_timestamp_check"`
+
+	// Upstream — when set, the proxy relays to this server instead of
+	// Telegram DCs directly.  Useful for chaining:
+	//   client → front (RU) → upstream (abroad) → Telegram DC
+	Upstream *UpstreamConfig `yaml:"upstream"`
+
 	Metrics MetricsConfig `yaml:"metrics"`
 	Log     LogConfig     `yaml:"log"`
+}
+
+// UpstreamConfig describes the backend server the proxy connects to.
+type UpstreamConfig struct {
+	Host string `yaml:"host"`
+	Port int    `yaml:"port"`
+}
+
+func (u *UpstreamConfig) Addr() string {
+	return fmt.Sprintf("%s:%d", u.Host, u.Port)
 }
 
 type MetricsConfig struct {

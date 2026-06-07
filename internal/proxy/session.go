@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/guvchick/mtproto-proxy/internal/config"
 	"github.com/guvchick/mtproto-proxy/internal/dc"
 	"github.com/guvchick/mtproto-proxy/internal/faketls"
 	"github.com/guvchick/mtproto-proxy/internal/obfs"
@@ -15,28 +16,27 @@ import (
 	"github.com/guvchick/mtproto-proxy/internal/telemetry"
 )
 
-// session handles a single client connection end-to-end.
 type session struct {
-	conn    net.Conn
-	sec     *secret.Secret
-	family  dc.AddrFamily
-	metrics *telemetry.Metrics
-	log     *slog.Logger
-	bufSize int
+	conn     net.Conn
+	sec      *secret.Secret
+	family   dc.AddrFamily
+	upstream *config.UpstreamConfig
+	tlsOpts  faketls.Options
+	metrics  *telemetry.Metrics
+	log      *slog.Logger
+	bufSize  int
 }
 
 func (s *session) handle() {
 	defer s.conn.Close()
 
-	clientAddr := s.conn.RemoteAddr().String()
-	log := s.log.With("client", clientAddr)
-
+	log := s.log.With("client", s.conn.RemoteAddr().String())
 	s.metrics.TotalConnections.Inc()
 	s.metrics.ActiveConnections.Inc()
 	defer s.metrics.ActiveConnections.Dec()
 
-	// Step 1: perform the handshake (optionally fake-TLS, then obfuscated2).
-	cipher, err := s.handshake(log)
+	// Read the 64-byte obfuscated2 nonce (strips fake-TLS layer if needed).
+	nonce, err := s.readNonce()
 	if err != nil {
 		log.Debug("handshake failed", "err", err)
 		s.metrics.RejectedConnections.Inc()
@@ -44,11 +44,40 @@ func (s *session) handle() {
 		return
 	}
 
+	if s.upstream != nil {
+		s.relayToUpstream(nonce, log)
+	} else {
+		s.relayToDC(nonce, log)
+	}
+}
+
+// readNonce returns the raw 64-byte obfuscated2 nonce.
+// For fake-TLS secrets it first completes the TLS masquerade.
+func (s *session) readNonce() ([]byte, error) {
+	if s.sec.Type == secret.TypeFakeTLS {
+		return faketls.Handshake(s.conn, s.sec.Key, s.sec.Domain, s.tlsOpts)
+	}
+	nonce := make([]byte, 64)
+	if _, err := io.ReadFull(s.conn, nonce); err != nil {
+		return nil, fmt.Errorf("read nonce: %w", err)
+	}
+	return nonce, nil
+}
+
+// relayToDC decrypts the nonce, connects to the Telegram DC, and relays data.
+func (s *session) relayToDC(nonce []byte, log *slog.Logger) {
+	cipher, err := obfs.New(nonce, s.sec.Key)
+	if err != nil {
+		log.Debug("obfs handshake failed", "err", err)
+		s.metrics.RejectedConnections.Inc()
+		s.metrics.HandshakeErrors.WithLabelValues(errReason(err)).Inc()
+		return
+	}
+
 	log = log.With("dc", cipher.DC, "proto", cipher.Protocol)
-	log.Debug("handshake ok")
+	log.Debug("connected to DC")
 	s.metrics.ConnectionsByDC.WithLabelValues(fmt.Sprintf("%d", cipher.DC)).Inc()
 
-	// Step 2: connect to the Telegram DC.
 	dcConn, err := dc.Dial(cipher.DC, s.family)
 	if err != nil {
 		log.Warn("dial DC failed", "err", err)
@@ -57,19 +86,13 @@ func (s *session) handle() {
 	}
 	defer dcConn.Close()
 
-	// Step 3: send protocol init tag to DC.
 	if _, err := dcConn.Write(cipher.InitTag()); err != nil {
 		log.Warn("write init tag failed", "err", err)
 		return
 	}
 
-	// Step 4: relay bidirectionally.
-	//
-	// For fake-TLS connections the client-facing streams are additionally
-	// wrapped in TLS application-data records.
 	var clientRead io.Reader
 	var clientWrite io.Writer
-
 	if s.sec.Type == secret.TypeFakeTLS {
 		clientRead = cipher.NewReader(faketls.NewRecordReader(s.conn))
 		clientWrite = cipher.NewWriter(faketls.NewRecordWriter(s.conn))
@@ -78,39 +101,58 @@ func (s *session) handle() {
 		clientWrite = cipher.NewWriter(s.conn)
 	}
 
-	stats := relay.Run(
-		s.conn, dcConn,
-		clientRead, clientWrite,
-		relay.WithBufSize(s.bufSize),
-	)
-
-	fromClient := stats.BytesFromClient.Load()
-	fromDC := stats.BytesFromDC.Load()
-	s.metrics.BytesFromClients.Add(float64(fromClient))
-	s.metrics.BytesFromDCs.Add(float64(fromDC))
-	log.Debug("session closed", "bytes_up", fromClient, "bytes_down", fromDC)
+	stats := relay.Run(s.conn, dcConn, clientRead, clientWrite,
+		relay.WithBufSize(s.bufSize))
+	s.metrics.BytesFromClients.Add(float64(stats.BytesFromClient.Load()))
+	s.metrics.BytesFromDCs.Add(float64(stats.BytesFromDC.Load()))
+	log.Debug("session closed",
+		"up", stats.BytesFromClient.Load(),
+		"down", stats.BytesFromDC.Load())
 }
 
-// handshake reads the client's init frame, validates the secret, and returns
-// a ready-to-use obfuscated2 cipher.
-func (s *session) handshake(log *slog.Logger) (*obfs.Cipher, error) {
-	var nonce []byte
+// relayToUpstream forwards the raw obfuscated2 stream to another proxy server.
+// The front proxy only handles the fake-TLS masquerade layer; the upstream
+// does the full obfuscated2 decode and DC connection.
+//
+// Data flow:
+//
+//	client ←[TLS records]→ front proxy ←[raw TCP]→ upstream → Telegram DC
+func (s *session) relayToUpstream(nonce []byte, log *slog.Logger) {
+	upConn, err := net.Dial("tcp", s.upstream.Addr())
+	if err != nil {
+		log.Warn("dial upstream failed", "addr", s.upstream.Addr(), "err", err)
+		s.metrics.RejectedConnections.Inc()
+		return
+	}
+	defer upConn.Close()
 
-	if s.sec.Type == secret.TypeFakeTLS {
-		var err error
-		nonce, err = faketls.Handshake(s.conn, s.sec.Key, s.sec.Domain)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		// Plain obfuscated2: client sends 64-byte nonce directly.
-		nonce = make([]byte, 64)
-		if _, err := io.ReadFull(s.conn, nonce); err != nil {
-			return nil, fmt.Errorf("read nonce: %w", err)
-		}
+	// Send the raw obfuscated2 nonce to the upstream proxy first.
+	if _, err := upConn.Write(nonce); err != nil {
+		log.Warn("send nonce to upstream failed", "err", err)
+		return
 	}
 
-	return obfs.New(nonce, s.sec.Key)
+	log.Debug("relaying to upstream", "upstream", s.upstream.Addr())
+
+	// Client side: strip/wrap TLS records for fake-TLS secrets.
+	// Upstream side: raw TCP (upstream handles obfuscated2 itself).
+	var clientRead io.Reader
+	var clientWrite io.Writer
+	if s.sec.Type == secret.TypeFakeTLS {
+		clientRead = faketls.NewRecordReader(s.conn)
+		clientWrite = faketls.NewRecordWriter(s.conn)
+	} else {
+		clientRead = s.conn
+		clientWrite = s.conn
+	}
+
+	stats := relay.Run(s.conn, upConn, clientRead, clientWrite,
+		relay.WithBufSize(s.bufSize))
+	s.metrics.BytesFromClients.Add(float64(stats.BytesFromClient.Load()))
+	s.metrics.BytesFromDCs.Add(float64(stats.BytesFromDC.Load()))
+	log.Debug("upstream session closed",
+		"up", stats.BytesFromClient.Load(),
+		"down", stats.BytesFromDC.Load())
 }
 
 func errReason(err error) string {

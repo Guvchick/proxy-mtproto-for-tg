@@ -1,4 +1,3 @@
-// Package proxy wires the listener, per-connection sessions, and telemetry.
 package proxy
 
 import (
@@ -8,6 +7,7 @@ import (
 
 	"github.com/guvchick/mtproto-proxy/internal/config"
 	"github.com/guvchick/mtproto-proxy/internal/dc"
+	"github.com/guvchick/mtproto-proxy/internal/faketls"
 	"github.com/guvchick/mtproto-proxy/internal/secret"
 	"github.com/guvchick/mtproto-proxy/internal/telemetry"
 )
@@ -17,6 +17,7 @@ type Server struct {
 	cfg     *config.Config
 	sec     *secret.Secret
 	family  dc.AddrFamily
+	tlsOpts faketls.Options
 	metrics *telemetry.Metrics
 	log     *slog.Logger
 }
@@ -34,9 +35,13 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:     cfg,
-		sec:     sec,
-		family:  family,
+		cfg:    cfg,
+		sec:    sec,
+		family: family,
+		tlsOpts: faketls.Options{
+			SkipHMAC:      cfg.SkipHMACCheck,
+			SkipTimestamp: cfg.SkipTimestampCheck,
+		},
 		metrics: telemetry.New(),
 		log:     log,
 	}, nil
@@ -48,10 +53,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	upstreamInfo := "none (direct to Telegram DC)"
+	if s.cfg.Upstream != nil {
+		upstreamInfo = s.cfg.Upstream.Addr()
+	}
 	s.log.Info("proxy listening",
 		"addr", s.cfg.Listen,
 		"secret_type", secretTypeName(s.sec.Type),
 		"domain", s.sec.Domain,
+		"upstream", upstreamInfo,
 	)
 
 	go func() {
@@ -74,17 +85,18 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 }
 
-// Metrics returns the server's metrics registry (for testing / introspection).
 func (s *Server) Metrics() *telemetry.Metrics { return s.metrics }
 
 func (s *Server) newSession(conn net.Conn) *session {
 	return &session{
-		conn:    conn,
-		sec:     s.sec,
-		family:  s.family,
-		metrics: s.metrics,
-		log:     s.log,
-		bufSize: max(s.cfg.ReadBufSize, 4096),
+		conn:     conn,
+		sec:      s.sec,
+		family:   s.family,
+		upstream: s.cfg.Upstream,
+		tlsOpts:  s.tlsOpts,
+		metrics:  s.metrics,
+		log:      s.log,
+		bufSize:  max(s.cfg.ReadBufSize, 4096),
 	}
 }
 
